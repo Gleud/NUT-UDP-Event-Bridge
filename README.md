@@ -96,7 +96,7 @@ The script will send periodic UDP JSON packets to the defined receiver.
 |-------|--------------|
 | `alive` | 1 if bridge and NUT communication OK, 0 if connection or script stopped |
 | `timestamp` | UNIX timestamp of the reading |
-| `ups_status` | 1 = Online, 2 = On battery, 3 = Low battery, 9 = Unknown |
+| `ups_status` | 1 Online, 2 On battery, 3 Low battery, 4 Replace battery, 5 Overload, 6 Forced shutdown, 9 Unknown |
 | `status_raw` | Full UPS status text |
 | `battery_percent` | Battery charge percentage |
 | `runtime_total_sec` | Total runtime in seconds |
