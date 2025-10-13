@@ -1,0 +1,10 @@
+{
+  "udp_receiver_ip": "<YOUR UDP RECEIVER / MINISERVER IP>",
+  "udp_receiver_port": 9999,
+  "nut_target": "qnapups@<YOUR UPS NUT MASTER IP>",
+  "intervall_ol": 10,
+  "dev_sample_file": "examples/sample_upsc.txt",
+  "hostname_override": "",
+  "log_level": "DEBUG",
+  "upsc_timeout_sec": 10
+}

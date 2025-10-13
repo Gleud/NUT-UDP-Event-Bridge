@@ -1,0 +1,41 @@
+Init SSL without certificate database
+battery.charge: 20
+battery.charge.low: 10
+battery.mfr.date: 2001/01/01
+battery.runtime: 150
+battery.runtime.low: 120
+battery.type: PbAc
+battery.voltage: 27.3
+battery.voltage.nominal: 24.0
+device.mfr: American Power Conversion
+device.model: Back-UPS BX1600MI
+device.serial: 9B2420A18233
+device.type: ups
+driver.name: usbhid-ups
+driver.parameter.pollfreq: 30
+driver.parameter.pollinterval: 2
+driver.parameter.port: /dev/ttyS1
+driver.parameter.synchronous: no
+driver.version: 2.7.4
+driver.version.data: APC HID 0.96
+driver.version.internal: 0.41
+input.sensitivity: medium
+input.transfer.high: 295
+input.transfer.low: 145
+input.transfer.reason: input voltage out of range
+input.voltage: 226.0
+input.voltage.nominal: 230
+ups.beeper.status: disabled
+ups.delay.shutdown: 20
+ups.load: 18
+ups.mfr: American Power Conversion
+ups.mfr.date: 2024/05/15
+ups.model: Back-UPS BX1600MI
+ups.productid: 0002
+ups.realpower.nominal: 900
+ups.serial: 9B2420A18233
+ups.status: LB DISCH
+ups.test.result: Done and passed
+ups.timer.reboot: 0
+ups.timer.shutdown: -1
+ups.vendorid: 051d
