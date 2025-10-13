@@ -44,20 +44,29 @@ def now_ts() -> int:
 
 def map_status(raw: str):
     """
-    Map NUT ups.status string to (numeric_code, expanded_text).
-    1=Online, 2=On battery, 3=Low battery, 9=Unknown
+    Map NUT ups.status string to a single numeric code with severity priority:
+    6 Forced shutdown > 5 Overload > 4 Replace battery > 3 Low battery > 2 On battery > 1 Online > 9 Unknown
+    Returns: (code:int, text:str)
     """
     s = (raw or "").strip().upper()
+
     if not s:
         return 9, "unknown"
-    # Prioritize low-battery if present together with OB
+
+    # Highest severity first
+    if "FSD" in s:
+        return 6, "Forced shutdown"
+    if "OVER" in s:
+        return 5, "Overload"
+    if "RB" in s or "REPLACE" in s:
+        return 4, "Replace battery"
     if "LB" in s or "LOW" in s:
         return 3, "Low battery"
     if "OB" in s or "ONBATT" in s or "ON BATTERY" in s:
         return 2, "On battery"
     if "OL" in s or "ONLINE" in s:
         return 1, "Online"
-    # Unknown other flags -> report as unknown
+
     return 9, "unknown"
 
 def parse_charging_flag(raw: str) -> int:
