@@ -34,7 +34,7 @@ ups.model: Back-UPS BX1600MI
 ups.productid: 0002
 ups.realpower.nominal: 900
 ups.serial: 9B2420A18233
-ups.status: LB DISCH
+ups.status: OL LB CHRG
 ups.test.result: Done and passed
 ups.timer.reboot: 0
 ups.timer.shutdown: -1

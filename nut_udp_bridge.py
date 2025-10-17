@@ -43,11 +43,14 @@ def now_ts() -> int:
     return int(time.time())
 
 def map_status(raw: str):
+    # TODO: consider "Degraded" state? State combos (eg. ups.status: OL CHRG LB)
+
     """
     Map NUT ups.status string to a single numeric code with severity priority:
     6 Forced shutdown > 5 Overload > 4 Replace battery > 3 Low battery > 2 On battery > 1 Online > 9 Unknown
     Returns: (code:int, text:str)
     """
+
     s = (raw or "").strip().upper()
 
     if not s:
@@ -55,19 +58,31 @@ def map_status(raw: str):
 
     # Highest severity first
     if "FSD" in s:
-        return 6, "Forced shutdown"
+        return 6, "shutdown_imminent"
     if "OVER" in s:
-        return 5, "Overload"
+        return 5, "overload"
     if "RB" in s or "REPLACE" in s:
-        return 4, "Replace battery"
+        return 4, "replace_battery"
     if "LB" in s or "LOW" in s:
-        return 3, "Low battery"
+        return 3, "low_battery"
     if "OB" in s or "ONBATT" in s or "ON BATTERY" in s:
-        return 2, "On battery"
+        return 2, "on_battery"
     if "OL" in s or "ONLINE" in s:
-        return 1, "Online"
+        return 1, "online"
 
     return 9, "unknown"
+
+
+def parse_ups_on_line(raw: str) -> int:
+    """
+    Returns 1 if UPS is on mains (OL), 0 if on battery (OB/ONBATT), -1 if unknown.
+    """
+    s = (raw or "").upper()
+    if "OB" in s or "ONBATT" in s or "ON BATTERY" in s:
+        return 0
+    if "OL" in s or "ONLINE" in s:
+        return 1
+    return -1
 
 def parse_charging_flag(raw: str) -> int:
     """
@@ -176,6 +191,7 @@ class UPSUDPBridge:
                     "host": self.hostname,
                     "alive": 0,
                     "ups_status": 9,
+                    "ups_on_line": -1,
                     "status_raw": "unknown",
                     "error": str(e)
                 })
@@ -196,7 +212,8 @@ class UPSUDPBridge:
                 "host": self.hostname,
                 "alive": 1,  # we reached NUT successfully
                 "ups_status": status_num,
-                "status_raw": status_text
+                "ups_on_line": parse_ups_on_line(status_str),
+                "status_raw": (status_str or "").lower().strip()
             }
 
             if chg != -1:
@@ -277,7 +294,8 @@ class UPSUDPBridge:
             "host": self.hostname,
             "alive": 0,
             "ups_status": self.last_known_status_num,
-            "status_raw": self.last_known_status_text
+            "ups_on_line": parse_ups_on_line(self.last_known_status_text),
+            "status_raw": (self.last_known_status_text or "").lower().strip()
         }
         self._send_packet(pkt)
         # give UDP a breath
