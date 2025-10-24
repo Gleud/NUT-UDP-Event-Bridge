@@ -24,6 +24,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Optional
 import math
+import atexit
 
 DEFAULT_CONFIG = {
     "udp_receiver_ip": "127.0.0.1",
@@ -34,7 +35,9 @@ DEFAULT_CONFIG = {
     "hostname_override": "",
     "log_level": "INFO",
     "log_file": "ups_udp_bridge.log",
-    "upsc_timeout_sec": 3
+    "upsc_timeout_sec": 3,
+    "rb_debounce_polls": 12,
+    "rb_ignore_during_selftest": True
 }
 
 BACKOFF_ERROR_SEC = 10  # fixed 10s backoff on communication errors
@@ -124,6 +127,14 @@ def to_int(v: Optional[str]) -> Optional[int]:
         except Exception:
             return None
 
+def _filter_rb_tokens(status_str: str) -> str:
+    """
+    Entfernt RB/REPLACE-Tokens aus einem ups.status-String.
+    """
+    tokens = (status_str or "").split()
+    drop = {"RB", "REPLACE", "REPLACEBATTERY", "BATTREPLACE"}
+    return " ".join(t for t in tokens if t.upper() not in drop)
+
 def build_logger(log_file: str, log_level: str) -> logging.Logger:
     logger = logging.getLogger("ups_udp_bridge")
     logger.setLevel(logging.DEBUG)  # capture all; handlers filter
@@ -163,20 +174,120 @@ class UPSUDPBridge:
         self.running = True
         self.last_known_status_num = 9
         self.last_known_status_text = "unknown"
+        self._dead_sent = False
+        self.rb_count = 0
+        self.rb_threshold = int(self.cfg.get("rb_debounce_polls", 12))
+        self.rb_ignore_during_selftest = bool(self.cfg.get("rb_ignore_during_selftest", True))
 
         signal.signal(signal.SIGINT, self._sig_handler)
         signal.signal(signal.SIGTERM, self._sig_handler)
+        # zusätzlich:
+        try:
+            signal.signal(signal.SIGHUP, self._sig_handler)
+        except Exception:
+            pass
+        try:
+            signal.signal(signal.SIGQUIT, self._sig_handler)
+        except Exception:
+            pass
+        # Fallback, falls kein Signal mehr zugestellt wird:
+        atexit.register(self._send_dead_packet)
 
         self.logger.info(
             "Starting UPS UDP bridge | target=%s:%s | dev_mode=%s | nut_target=%s",
             self.target[0], self.target[1], self.dev_mode, self.cfg.get("nut_target")
         )
 
+    def _selftest_active(self, data: Dict[str, str]) -> bool:
+        """
+        Erkenne laufenden Selbsttest anhand typischer Texte in ups.test.result.
+        Beeinflusst nur die interne Bewertung, nicht das Payload-Schema.
+        """
+        txt = (data.get("ups.test.result") or "").strip().lower()
+        return any(k in txt for k in [
+            "in progress", "progress", "testing", "self-test in progress", "selftest in progress"
+        ])
+
     def _sig_handler(self, *_):
         self.logger.info("Signal received -> shutting down")
         self.running = False
-        # send final dead packet immediately
+        # Dead-Packet
         self._send_dead_packet()
+
+    def _send_dead_packet(self):
+        if getattr(self, "_dead_sent", False):
+            return
+        try:
+            pkt = {
+                "source": "ups",
+                "timestamp": now_ts(),
+                "host": self.hostname,
+                "alive": 0,
+                "ups_status": self.last_known_status_num,
+                "ups_on_line": parse_ups_on_line(self.last_known_status_text),
+                "status_raw": (self.last_known_status_text or "").lower().strip()
+            }
+            self._send_packet(pkt)
+            # kurze Pause, damit UDP rausgeht (falls Netz noch lebt)
+            time.sleep(0.05)
+        except Exception as e:
+            self.logger.debug("dead-packet send failed: %s", e)
+        finally:
+            self._dead_sent = True
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+    def _send_packet(self, payload: Dict):
+        try:
+            data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            self.sock.sendto(data, self.target)
+            self.logger.debug("Sent UDP: %s", payload)
+        except Exception as e:
+            self.logger.error("UDP send error: %s", e)
+
+    def _query_upsc(self) -> Dict[str, str]:
+        """
+        Return dict of key -> value (strings) from either:
+        - macOS dev file (sample_upsc.txt), or
+        - `upsc <nut_target>` stdout.
+        """
+        if platform.system() == "Darwin":
+            path = Path(self.cfg.get("dev_sample_file", "sample_upsc.txt"))
+            if not path.exists():
+                raise RuntimeError(f"Dev sample file not found: {path}")
+            content = path.read_text(encoding="utf-8")
+            self.logger.debug("Read dev sample file: %s (%d bytes)", path, len(content))
+        else:
+            cmd = ["upsc", self.cfg["nut_target"]]
+            self.logger.debug("Running: %s", " ".join(cmd))
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=int(self.cfg.get("upsc_timeout_sec", 3))
+                )
+            except FileNotFoundError:
+                raise RuntimeError("upsc binary not found")
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("upsc command timed out")
+            if proc.returncode != 0:
+                err = proc.stderr.strip() or proc.stdout.strip()
+                raise RuntimeError(f"upsc error rc={proc.returncode}: {err}")
+            content = proc.stdout
+            if not content:
+                raise RuntimeError("upsc returned empty output")
+
+        parsed: Dict[str, str] = {}
+        for line in content.splitlines():
+            # Ignore lines without colon (e.g., "Init SSL without certificate database")
+            if ":" not in line:
+                self.logger.debug("Ignoring non KV line: %s", line)
+                continue
+            k, v = line.split(":", 1)
+            parsed[k.strip()] = v.strip()
+        self.logger.debug("Parsed %d keys from NUT/dev sample", len(parsed))
+        return parsed
 
     def run(self):
         while self.running:
@@ -198,10 +309,34 @@ class UPSUDPBridge:
                 time.sleep(BACKOFF_ERROR_SEC)
                 continue
 
-            # parse/normalize fields
-            status_str = data.get("ups.status", "")
-            status_num, status_text = map_status(status_str)
-            chg = parse_charging_flag(status_str)
+            # --- parse/normalize fields ---
+            status_str_raw = data.get("ups.status", "")  # Original vom Treiber
+            up_upper = (status_str_raw or "").upper()
+
+            # RB- und Selbsttest-Erkennung
+            raw_rb = ("RB" in up_upper) or ("REPLACE" in up_upper)
+            st_active = self._selftest_active(data)
+
+            # Debounce-Zähler pflegen (RB nur zählen, wenn nicht im Selbsttest – falls konfiguriert)
+            if raw_rb and not (self.rb_ignore_during_selftest and st_active):
+                self.rb_count += 1
+            else:
+                if self.rb_count != 0:
+                    self.logger.debug("RB debounce reset (raw_rb=%s, selftest_active=%s)", raw_rb, st_active)
+                self.rb_count = 0
+
+            # Darf RB wirksam sein?
+            rb_allowed = raw_rb and (self.rb_count >= self.rb_threshold) and not (
+                    self.rb_ignore_during_selftest and st_active
+            )
+
+            # Effektiver Statusstring für Mapping/Output:
+            # -> solange RB NICHT erlaubt ist: RB-Tokens entfernen, damit Mapping NICHT sofort greift.
+            eff_status_str = status_str_raw if rb_allowed else _filter_rb_tokens(status_str_raw)
+
+            # Ab hier nur noch mit dem gefilterten String arbeiten:
+            status_num, status_text = map_status(eff_status_str)
+            chg = parse_charging_flag(eff_status_str)
 
             self.last_known_status_num = status_num
             self.last_known_status_text = status_text
@@ -212,8 +347,8 @@ class UPSUDPBridge:
                 "host": self.hostname,
                 "alive": 1,  # we reached NUT successfully
                 "ups_status": status_num,
-                "ups_on_line": parse_ups_on_line(status_str),
-                "status_raw": (status_str or "").lower().strip()
+                "ups_on_line": parse_ups_on_line(eff_status_str),
+                "status_raw": (eff_status_str or "").lower().strip()
             }
 
             if chg != -1:
@@ -275,7 +410,7 @@ class UPSUDPBridge:
 
             self._send_packet(payload)
 
-            # sleep by state: Online -> intervall_ol, otherwise 1s
+            # Sleep-Strategie (wie zuvor)
             if status_num == 1:
                 sleep_s = max(1, int(self.cfg.get("intervall_ol", 10)))
             else:
@@ -283,73 +418,9 @@ class UPSUDPBridge:
             self.logger.debug("Sleeping %ss (status=%s)", sleep_s, status_text)
             time.sleep(sleep_s)
 
-        # if loop exits without signal dead-packet, send it now
+        # wenn die Schleife endet, sende Dead-Packet (falls nicht schon gesendet)
         self._send_dead_packet()
         self.logger.info("Stopped")
-
-    def _send_dead_packet(self):
-        pkt = {
-            "source": "ups",
-            "timestamp": now_ts(),
-            "host": self.hostname,
-            "alive": 0,
-            "ups_status": self.last_known_status_num,
-            "ups_on_line": parse_ups_on_line(self.last_known_status_text),
-            "status_raw": (self.last_known_status_text or "").lower().strip()
-        }
-        self._send_packet(pkt)
-        # give UDP a breath
-        time.sleep(0.05)
-
-    def _send_packet(self, payload: Dict):
-        try:
-            data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            self.sock.sendto(data, self.target)
-            self.logger.debug("Sent UDP: %s", payload)
-        except Exception as e:
-            self.logger.error("UDP send error: %s", e)
-
-    def _query_upsc(self) -> Dict[str, str]:
-        """
-        Return dict of key -> value (strings) from either:
-        - macOS dev file (sample_upsc.txt), or
-        - `upsc <nut_target>` stdout.
-        """
-        if platform.system() == "Darwin":
-            path = Path(self.cfg.get("dev_sample_file", "sample_upsc.txt"))
-            if not path.exists():
-                raise RuntimeError(f"Dev sample file not found: {path}")
-            content = path.read_text(encoding="utf-8")
-            self.logger.debug("Read dev sample file: %s (%d bytes)", path, len(content))
-        else:
-            cmd = ["upsc", self.cfg["nut_target"]]
-            self.logger.debug("Running: %s", " ".join(cmd))
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True,
-                    timeout=int(self.cfg.get("upsc_timeout_sec", 3))
-                )
-            except FileNotFoundError:
-                raise RuntimeError("upsc binary not found")
-            except subprocess.TimeoutExpired:
-                raise RuntimeError("upsc command timed out")
-            if proc.returncode != 0:
-                err = proc.stderr.strip() or proc.stdout.strip()
-                raise RuntimeError(f"upsc error rc={proc.returncode}: {err}")
-            content = proc.stdout
-            if not content:
-                raise RuntimeError("upsc returned empty output")
-
-        parsed: Dict[str, str] = {}
-        for line in content.splitlines():
-            # Ignore lines without colon (e.g., "Init SSL without certificate database")
-            if ":" not in line:
-                self.logger.debug("Ignoring non KV line: %s", line)
-                continue
-            k, v = line.split(":", 1)
-            parsed[k.strip()] = v.strip()
-        self.logger.debug("Parsed %d keys from NUT/dev sample", len(parsed))
-        return parsed
 
 def load_config(path: Path) -> Dict:
     if not path.exists():
