@@ -4,7 +4,7 @@ UPS -> UDP bridge (NUT client)
 - Polls NUT via `upsc <nut_target>` (Ubuntu) OR reads a sample file on macOS (Darwin).
 - Sends a single-line JSON UDP packet each cycle (flat schema, English keys).
 - alive == 1 while the script runs AND NUT/UPS is reachable (even on battery).
-- On error (no NUT data) send alive=0 and back off 10s.
+- On error (no NUT data) send alive=0 (debounced) and back off 10s.
 - On SIGINT/SIGTERM send one last packet with alive=0, then exit.
 - Logging: rotating file (5 MB, keep 3 backups) + console.
 
@@ -36,8 +36,12 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "log_file": "ups_udp_bridge.log",
     "upsc_timeout_sec": 3,
-    "rb_debounce_polls": 12,
-    "rb_ignore_during_selftest": True
+
+    # Debounce for Replace-Battery status, unknown, com errors
+    "rb_ignore_during_selftest": True, # ignore RB status during self-test
+    "rb_debounce_polls": 5,        # number of RB polls before RB is considered valid
+    "comms_debounce_polls": 5,       # number of comms errors before alive=0 is sent
+    "unknown_debounce_polls": 5      # number of unknown-status polls before accepting unknown
 }
 
 BACKOFF_ERROR_SEC = 10  # fixed 10s backoff on communication errors
@@ -47,19 +51,14 @@ def now_ts() -> int:
 
 def map_status(raw: str):
     # TODO: consider "Degraded" state? State combos (eg. ups.status: OL CHRG LB)
-
     """
     Map NUT ups.status string to a single numeric code with severity priority:
     6 Forced shutdown > 5 Overload > 4 Replace battery > 3 Low battery > 2 On battery > 1 Online > 9 Unknown
     Returns: (code:int, text:str)
     """
-
     s = (raw or "").strip().upper()
-
     if not s:
         return 9, "unknown"
-
-    # Highest severity first
     if "FSD" in s:
         return 6, "shutdown_imminent"
     if "OVER" in s:
@@ -72,9 +71,7 @@ def map_status(raw: str):
         return 2, "on_battery"
     if "OL" in s or "ONLINE" in s:
         return 1, "online"
-
     return 9, "unknown"
-
 
 def parse_ups_on_line(raw: str) -> int:
     """
@@ -139,13 +136,11 @@ def build_logger(log_file: str, log_level: str) -> logging.Logger:
     logger = logging.getLogger("ups_udp_bridge")
     logger.setLevel(logging.DEBUG)  # capture all; handlers filter
 
-    # Formatter
     fmt = logging.Formatter(
         fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z"
     )
 
-    # Rotating file handler: 5 MB, 3 backups
     file_handler = RotatingFileHandler(
         log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
@@ -153,13 +148,11 @@ def build_logger(log_file: str, log_level: str) -> logging.Logger:
     file_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     logger.addHandler(file_handler)
 
-    # Console handler
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(fmt)
     console.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     logger.addHandler(console)
 
-    # Avoid duplicate handlers if build_logger called multiple times
     logger.propagate = False
     return logger
 
@@ -175,13 +168,20 @@ class UPSUDPBridge:
         self.last_known_status_num = 9
         self.last_known_status_text = "unknown"
         self._dead_sent = False
+
+        # RB debounce
         self.rb_count = 0
         self.rb_threshold = int(self.cfg.get("rb_debounce_polls", 12))
         self.rb_ignore_during_selftest = bool(self.cfg.get("rb_ignore_during_selftest", True))
 
+        # Debounces
+        self.comms_fail_count = 0
+        self.comms_debounce = int(self.cfg.get("comms_debounce_polls", 3))
+        self.unknown_count = 0
+        self.unknown_debounce = int(self.cfg.get("unknown_debounce_polls", 2))
+
         signal.signal(signal.SIGINT, self._sig_handler)
         signal.signal(signal.SIGTERM, self._sig_handler)
-        # zusätzlich:
         try:
             signal.signal(signal.SIGHUP, self._sig_handler)
         except Exception:
@@ -190,7 +190,6 @@ class UPSUDPBridge:
             signal.signal(signal.SIGQUIT, self._sig_handler)
         except Exception:
             pass
-        # Fallback, falls kein Signal mehr zugestellt wird:
         atexit.register(self._send_dead_packet)
 
         self.logger.info(
@@ -211,7 +210,6 @@ class UPSUDPBridge:
     def _sig_handler(self, *_):
         self.logger.info("Signal received -> shutting down")
         self.running = False
-        # Dead-Packet
         self._send_dead_packet()
 
     def _send_dead_packet(self):
@@ -228,7 +226,6 @@ class UPSUDPBridge:
                 "status_raw": (self.last_known_status_text or "").lower().strip()
             }
             self._send_packet(pkt)
-            # kurze Pause, damit UDP rausgeht (falls Netz noch lebt)
             time.sleep(0.05)
         except Exception as e:
             self.logger.debug("dead-packet send failed: %s", e)
@@ -280,7 +277,6 @@ class UPSUDPBridge:
 
         parsed: Dict[str, str] = {}
         for line in content.splitlines():
-            # Ignore lines without colon (e.g., "Init SSL without certificate database")
             if ":" not in line:
                 self.logger.debug("Ignoring non KV line: %s", line)
                 continue
@@ -293,19 +289,43 @@ class UPSUDPBridge:
         while self.running:
             try:
                 data = self._query_upsc()
+                # Erfolg -> Kommunikationsfehler-Zähler zurücksetzen
+                if self.comms_fail_count:
+                    self.logger.debug("Comms debounce reset (had %d fails)", self.comms_fail_count)
+                self.comms_fail_count = 0
             except Exception as e:
-                self.logger.warning("NUT communication error: %s", e)
-                # comms error: send alive=0 + unknown state, then back off 10s
-                self._send_packet({
-                    "source": "ups",
-                    "timestamp": now_ts(),
-                    "host": self.hostname,
-                    "alive": 0,
-                    "ups_status": 9,
-                    "ups_on_line": -1,
-                    "status_raw": "unknown",
-                    "error": str(e)
-                })
+                self.comms_fail_count += 1
+                self.logger.warning("NUT communication error (%d/%d): %s",
+                                    self.comms_fail_count, self.comms_debounce, e)
+
+                if self.comms_fail_count >= self.comms_debounce:
+                    # erst jetzt wirklich alive=0 senden
+                    self._send_packet({
+                        "source": "ups",
+                        "timestamp": now_ts(),
+                        "host": self.hostname,
+                        "alive": 0,
+                        "ups_status": 9,
+                        "ups_on_line": -1,
+                        "status_raw": "unknown",
+                        "error": str(e),
+                        "comms_fail_count": self.comms_fail_count
+                    })
+                else:
+                    # Glitch-Info, aber alive bleibt 1 (unterdrückt Fehlalarm)
+                    self._send_packet({
+                        "source": "ups",
+                        "timestamp": now_ts(),
+                        "host": self.hostname,
+                        "alive": 1,
+                        "ups_status": self.last_known_status_num,
+                        "ups_on_line": parse_ups_on_line(self.last_known_status_text),
+                        "status_raw": (self.last_known_status_text or "").lower().strip(),
+                        "comms_glitch": 1,
+                        "error": str(e),
+                        "comms_fail_count": self.comms_fail_count
+                    })
+
                 time.sleep(BACKOFF_ERROR_SEC)
                 continue
 
@@ -327,16 +347,33 @@ class UPSUDPBridge:
 
             # Darf RB wirksam sein?
             rb_allowed = raw_rb and (self.rb_count >= self.rb_threshold) and not (
-                    self.rb_ignore_during_selftest and st_active
+                self.rb_ignore_during_selftest and st_active
             )
 
             # Effektiver Statusstring für Mapping/Output:
-            # -> solange RB NICHT erlaubt ist: RB-Tokens entfernen, damit Mapping NICHT sofort greift.
             eff_status_str = status_str_raw if rb_allowed else _filter_rb_tokens(status_str_raw)
 
-            # Ab hier nur noch mit dem gefilterten String arbeiten:
+            # Mapping
             status_num, status_text = map_status(eff_status_str)
             chg = parse_charging_flag(eff_status_str)
+
+            # Unknown-Debounce
+            if status_num == 9:
+                self.unknown_count += 1
+                if self.unknown_count < self.unknown_debounce:
+                    # Halte letzten gültigen Status
+                    self.logger.debug("Unknown debounce %d/%d -> keep last='%s'(%d)",
+                                      self.unknown_count, self.unknown_debounce,
+                                      self.last_known_status_text, self.last_known_status_num)
+                    status_num = self.last_known_status_num
+                    status_text = self.last_known_status_text
+                    # on_line vom letzten Status ableiten
+                    on_line = parse_ups_on_line(self.last_known_status_text)
+                else:
+                    on_line = parse_ups_on_line(eff_status_str)
+            else:
+                self.unknown_count = 0
+                on_line = parse_ups_on_line(eff_status_str)
 
             self.last_known_status_num = status_num
             self.last_known_status_text = status_text
@@ -345,9 +382,9 @@ class UPSUDPBridge:
                 "source": "ups",
                 "timestamp": now_ts(),
                 "host": self.hostname,
-                "alive": 1,  # we reached NUT successfully
+                "alive": 1,  # NUT erreichbar
                 "ups_status": status_num,
-                "ups_on_line": parse_ups_on_line(eff_status_str),
+                "ups_on_line": on_line,
                 "status_raw": (eff_status_str or "").lower().strip()
             }
 
@@ -371,7 +408,7 @@ class UPSUDPBridge:
             if inv is not None:
                 payload["input_voltage"] = inv
 
-            # optional enrichments (only if present/parsable)
+            # optional enrichments
             bv = to_float(data.get("battery.voltage"))
             if bv is not None:
                 payload["battery_voltage"] = bv
@@ -410,7 +447,7 @@ class UPSUDPBridge:
 
             self._send_packet(payload)
 
-            # Sleep-Strategie (wie zuvor)
+            # Sleep-Strategie
             if status_num == 1:
                 sleep_s = max(1, int(self.cfg.get("intervall_ol", 10)))
             else:
@@ -418,7 +455,6 @@ class UPSUDPBridge:
             self.logger.debug("Sleeping %ss (status=%s)", sleep_s, status_text)
             time.sleep(sleep_s)
 
-        # wenn die Schleife endet, sende Dead-Packet (falls nicht schon gesendet)
         self._send_dead_packet()
         self.logger.info("Stopped")
 
@@ -447,13 +483,13 @@ def main():
     try:
         bridge.run()
     except Exception as e:
-        # last resort: try to send one dead packet and exit non-zero
-        logger.exception("Fatal error: %s", e)
-        try:
-            bridge._send_dead_packet()
-        except Exception:
-            pass
-        sys.exit(1)
+            # last resort: try to send one dead packet and exit non-zero
+            logger.exception("Fatal error: %s", e)
+            try:
+                bridge._send_dead_packet()
+            except Exception:
+                pass
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
