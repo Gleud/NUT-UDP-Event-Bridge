@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
 
     # Debounce for Replace-Battery status, unknown, com errors
     "rb_ignore_during_selftest": True, # ignore RB status during self-test
-    "rb_debounce_polls": 5,        # number of RB polls before RB is considered valid
+    "rb_debounce_polls": 8,        # number of RB polls before RB is considered valid
     "comms_debounce_polls": 5,       # number of comms errors before alive=0 is sent
     "unknown_debounce_polls": 5      # number of unknown-status polls before accepting unknown
 }
@@ -123,6 +123,60 @@ def to_int(v: Optional[str]) -> Optional[int]:
             return int(txt.split()[0])
         except Exception:
             return None
+
+# System temperature from Host (Ubuntu)
+def read_system_temperature() -> Optional[float]:
+    """
+    Versucht, eine System-/CPU-Temperatur zu ermitteln.
+    1. /sys/class/thermal/thermal_zone*/temp (°C * 1000)
+    2. sensors -u (falls lm-sensors installiert)
+    Gibt float in °C zurück oder None, falls nichts gefunden.
+    """
+    # Variante 1: /sys/class/thermal
+    try:
+        base = Path("/sys/class/thermal")
+        temps = []
+        if base.exists():
+            for zone in base.glob("thermal_zone*/temp"):
+                try:
+                    raw = zone.read_text().strip()
+                    if raw:
+                        # meist Milligrad Celsius
+                        t = float(raw) / 1000.0
+                        if -50.0 < t < 150.0:  # grober Plausibilitätscheck
+                            temps.append(t)
+                except Exception:
+                    continue
+        if temps:
+            # Nimm die höchste Temperatur (konservativ, "worst case")
+            return max(temps)
+    except Exception:
+        pass
+
+    # Variante 2: lm-sensors
+    try:
+        proc = subprocess.run(
+            ["sensors", "-u"],
+            capture_output=True,
+            text=True,
+            timeout=3
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                # z.B.: temp1_input: 42.0
+                if "temp" in line and "input:" in line:
+                    parts = line.split()
+                    try:
+                        val = float(parts[-1])
+                        if -50.0 < val < 150.0:
+                            return val
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    return None
 
 def _filter_rb_tokens(status_str: str) -> str:
     """
@@ -225,6 +279,11 @@ class UPSUDPBridge:
                 "ups_on_line": parse_ups_on_line(self.last_known_status_text),
                 "status_raw": (self.last_known_status_text or "").lower().strip()
             }
+            # Systemtemperatur auch im finalen Paket anhängen, falls verfügbar
+            temp = read_system_temperature()
+            if temp is not None:
+                pkt["systemTemperature"] = temp
+
             self._send_packet(pkt)
             time.sleep(0.05)
         except Exception as e:
@@ -300,7 +359,7 @@ class UPSUDPBridge:
 
                 if self.comms_fail_count >= self.comms_debounce:
                     # erst jetzt wirklich alive=0 senden
-                    self._send_packet({
+                    payload = {
                         "source": "ups",
                         "timestamp": now_ts(),
                         "host": self.hostname,
@@ -310,10 +369,14 @@ class UPSUDPBridge:
                         "status_raw": "unknown",
                         "error": str(e),
                         "comms_fail_count": self.comms_fail_count
-                    })
+                    }
+                    temp = read_system_temperature()
+                    if temp is not None:
+                        payload["systemTemperature"] = temp
+                    self._send_packet(payload)
                 else:
                     # Glitch-Info, aber alive bleibt 1 (unterdrückt Fehlalarm)
-                    self._send_packet({
+                    payload = {
                         "source": "ups",
                         "timestamp": now_ts(),
                         "host": self.hostname,
@@ -324,7 +387,11 @@ class UPSUDPBridge:
                         "comms_glitch": 1,
                         "error": str(e),
                         "comms_fail_count": self.comms_fail_count
-                    })
+                    }
+                    temp = read_system_temperature()
+                    if temp is not None:
+                        payload["systemTemperature"] = temp
+                    self._send_packet(payload)
 
                 time.sleep(BACKOFF_ERROR_SEC)
                 continue
@@ -445,6 +512,11 @@ class UPSUDPBridge:
             if drv:
                 payload["driver_version"] = drv
 
+            # === NEU: Systemtemperatur anhängen, falls verfügbar ===
+            temp = read_system_temperature()
+            if temp is not None:
+                payload["systemTemperature"] = temp
+
             self._send_packet(payload)
 
             # Sleep-Strategie
@@ -483,13 +555,13 @@ def main():
     try:
         bridge.run()
     except Exception as e:
-            # last resort: try to send one dead packet and exit non-zero
-            logger.exception("Fatal error: %s", e)
-            try:
-                bridge._send_dead_packet()
-            except Exception:
-                pass
-            sys.exit(1)
+        # last resort: try to send one dead packet and exit non-zero
+        logger.exception("Fatal error: %s", e)
+        try:
+            bridge._send_dead_packet()
+        except Exception:
+            pass
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
